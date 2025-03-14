@@ -41,26 +41,38 @@ class AdamW(Optimizer):
 
                 # State should be stored in this dictionary.
                 state = self.state[p]
+                if len(state) == 0:
+                    state["step"] = 0
+                    state["exp_avg"] = torch.zeros_like(p.data)
+                    state["exp_avg_sq"] = torch.zeros_like(p.data)
 
-                # Access hyperparameters from the `group` dictionary.
-                alpha = group["lr"]
+                exp_avg, exp_avg_sq = state["exp_avg"], state["exp_avg_sq"]
+                beta1, beta2 = group["betas"]
 
-                # Complete the implementation of AdamW here, reading and saving
-                # your state in the `state` dictionary above.
-                # The hyperparameters can be read from the `group` dictionary
-                # (they are lr, betas, eps, weight_decay, as saved in the constructor).
-                #
-                # To complete this implementation:
-                # 1. Update the first and second moments of the gradients.
-                # 2. Apply bias correction
-                #    (using the "efficient version" given in https://arxiv.org/abs/1412.6980;
-                #     also given in the pseudo-code in the project description).
-                # 3. Update parameters (p.data).
-                # 4. Apply weight decay after the main gradient-based updates.
-                # Refer to the default project handout for more details.
+                state["step"] += 1
+                t = state["step"]
 
-                ### TODO
-                raise NotImplementedError
+                # Update biased first moment estimate
+                exp_avg.mul_(beta1).add_(grad, alpha=1 - beta1)
+                # Update biased second moment estimate
+                exp_avg_sq.mul_(beta2).addcmul_(grad, grad, value=1 - beta2)
 
+                if group["correct_bias"]:
+                    # Compute bias-corrected first moment estimate
+                    bias_correction1 = 1 - beta1 ** t
+                    # Compute bias-corrected second moment estimate
+                    bias_correction2 = 1 - beta2 ** t
+                    denom = (exp_avg_sq.sqrt() / (bias_correction2 ** 0.5)).add_(group["eps"])
+                    step_size = group["lr"] / bias_correction1
+                else:
+                    denom = exp_avg_sq.sqrt().add_(group["eps"])
+                    step_size = group["lr"]
+
+                # Parameter update
+                p.data.addcdiv_(exp_avg, denom, value=-step_size)
+
+                # Weight decay
+                if group["weight_decay"] != 0:
+                    p.data.add_(p.data, alpha=-group["weight_decay"] * group["lr"])
 
         return loss

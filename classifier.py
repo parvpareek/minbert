@@ -48,7 +48,8 @@ class BertSentimentClassifier(torch.nn.Module):
 
         # Create any instance variables you need to classify the sentiment of BERT embeddings.
         ### TODO
-        raise NotImplementedError
+        self.linear = torch.nn.Linear(config.hidden_size, self.num_labels)
+
 
 
     def forward(self, input_ids, attention_mask):
@@ -57,7 +58,9 @@ class BertSentimentClassifier(torch.nn.Module):
         # HINT: You should consider what is an appropriate return value given that
         # the training loop currently uses F.cross_entropy as the loss function.
         ### TODO
-        raise NotImplementedError
+        pooled_repr = self.bert(input_ids, attention_mask)['pooler_output']
+        out = F.softmax(self.linear(pooled_repr), dim=-1)
+        return out
 
 
 
