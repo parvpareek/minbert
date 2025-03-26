@@ -82,7 +82,9 @@ class MultitaskBERT(nn.Module):
         # When thinking of improvements, you can later try modifying this
         # (e.g., by adding other layers).
         ### TODO
-        raise NotImplementedError
+        output = self.bert(input_ids, attention_mask)
+        embeddings = output.pooler_output
+        return embeddings
 
 
     def predict_sentiment(self, input_ids, attention_mask):
@@ -92,7 +94,10 @@ class MultitaskBERT(nn.Module):
         Thus, your output should contain 5 logits for each sentence.
         '''
         ### TODO
-        raise NotImplementedError
+        embeddings = self.forward(input_ids, attention_mask)
+        embeddings = self.dropout(embeddings)
+        logits = self.sentiment_classifier(embeddings)  # Linear layer
+        return logits
 
 
     def predict_paraphrase(self,
@@ -103,7 +108,9 @@ class MultitaskBERT(nn.Module):
         during evaluation.
         '''
         ### TODO
-        raise NotImplementedError
+        emb1 = self.forward(input_ids_1, attention_mask_1)
+        emb2 = self.forward(input_ids_2, attention_mask_2)
+        return emb1, emb2
 
 
     def predict_similarity(self,
@@ -113,9 +120,20 @@ class MultitaskBERT(nn.Module):
         Note that your output should be unnormalized (a logit).
         '''
         ### TODO
-        raise NotImplementedError
+        emb1 = self.forward(input_ids_1, attention_mask_1)
+        emb2 = self.forward(input_ids_2, attention_mask_2)
+        return emb1, emb2
 
+def compute_paraphrase_loss(self, emb1, emb2, labels):
+    loss_fn = nn.CosineEmbeddingLoss(margin=0.5)
+    return loss_fn(emb1, emb2, 2 * labels.float() - 1)  # Convert 0/1 to -1/1
 
+def compute_sts_loss(self, emb1, emb2, labels):
+    cosine_sim = F.cosine_similarity(emb1, emb2)
+    return F.mse_loss(cosine_sim, labels)  # Labels are normalized similarity scores
+
+def compute_sentiment_loss(self, logits, labels):
+    return F.cross_entropy(logits, labels)
 
 
 def save_model(model, optimizer, args, config, filepath):
@@ -134,76 +152,143 @@ def save_model(model, optimizer, args, config, filepath):
 
 
 def train_multitask(args):
-    '''Train MultitaskBERT.
+    '''Train MultitaskBERT on SST, Quora, and SemEval datasets simultaneously.
 
-    Currently only trains on SST dataset. The way you incorporate training examples
-    from other datasets into the training procedure is up to you. To begin, take a
-    look at test_multitask below to see how you can use the custom torch `Dataset`s
-    in datasets.py to load in examples from the Quora and SemEval datasets.
+    This function trains the model using sentiment analysis (SST), paraphrase detection (Quora),
+    and semantic textual similarity (STS) tasks. It processes batches from all three datasets
+    in each training step, computes task-specific losses, combines them, and updates the model.
     '''
     device = torch.device('cuda') if args.use_gpu else torch.device('cpu')
-    # Create the data and its corresponding datasets and dataloader.
-    sst_train_data, num_labels,para_train_data, sts_train_data = load_multitask_data(args.sst_train,args.para_train,args.sts_train, split ='train')
-    sst_dev_data, num_labels,para_dev_data, sts_dev_data = load_multitask_data(args.sst_dev,args.para_dev,args.sts_dev, split ='train')
 
+    # ### 1. Load Data for All Tasks
+    # Load training and development data for SST, Quora, and STS datasets
+    sst_train_data, num_labels, para_train_data, sts_train_data = load_multitask_data(
+        args.sst_train, args.para_train, args.sts_train, split='train'
+    )
+    sst_dev_data, _, para_dev_data, sts_dev_data = load_multitask_data(
+        args.sst_dev, args.para_dev, args.sts_dev, split='dev'  # Corrected split to 'dev'
+    )
+
+    # ### 2. Create Datasets
+    # SST uses SentenceClassificationDataset for single-sentence classification
     sst_train_data = SentenceClassificationDataset(sst_train_data, args)
     sst_dev_data = SentenceClassificationDataset(sst_dev_data, args)
 
-    sst_train_dataloader = DataLoader(sst_train_data, shuffle=True, batch_size=args.batch_size,
-                                      collate_fn=sst_train_data.collate_fn)
-    sst_dev_dataloader = DataLoader(sst_dev_data, shuffle=False, batch_size=args.batch_size,
-                                    collate_fn=sst_dev_data.collate_fn)
+    # Quora and STS use SentencePairDataset for sentence-pair tasks
+    para_train_data = SentencePairDataset(para_train_data, args)
+    para_dev_data = SentencePairDataset(para_dev_data, args)
+    sts_train_data = SentencePairDataset(sts_train_data, args)
+    sts_dev_data = SentencePairDataset(sts_dev_data, args)
 
-    # Init model.
-    config = {'hidden_dropout_prob': args.hidden_dropout_prob,
-              'num_labels': num_labels,
-              'hidden_size': 768,
-              'data_dir': '.',
-              'option': args.option}
+    # ### 3. Create Data Loaders
+    sst_train_dataloader = DataLoader(
+        sst_train_data, shuffle=True, batch_size=args.batch_size, collate_fn=sst_train_data.collate_fn
+    )
+    sst_dev_dataloader = DataLoader(
+        sst_dev_data, shuffle=False, batch_size=args.batch_size, collate_fn=sst_dev_data.collate_fn
+    )
+    para_train_dataloader = DataLoader(
+        para_train_data, shuffle=True, batch_size=args.batch_size, collate_fn=para_train_data.collate_fn
+    )
+    para_dev_dataloader = DataLoader(
+        para_dev_data, shuffle=False, batch_size=args.batch_size, collate_fn=para_dev_data.collate_fn
+    )
+    sts_train_dataloader = DataLoader(
+        sts_train_data, shuffle=True, batch_size=args.batch_size, collate_fn=sts_train_data.collate_fn
+    )
+    sts_dev_dataloader = DataLoader(
+        sts_dev_data, shuffle=False, batch_size=args.batch_size, collate_fn=sts_dev_data.collate_fn
+    )
 
+    # ### 4. Initialize Model
+    config = {
+        'hidden_dropout_prob': args.hidden_dropout_prob,
+        'num_labels': num_labels,  # Used for sentiment classification head
+        'hidden_size': 768,
+        'data_dir': '.',
+        'option': args.option
+    }
     config = SimpleNamespace(**config)
-
     model = MultitaskBERT(config)
     model = model.to(device)
 
-    lr = args.lr
-    optimizer = AdamW(model.parameters(), lr=lr)
+    # ### 5. Set Up Optimizer
+    optimizer = AdamW(model.parameters(), lr=args.lr)
     best_dev_acc = 0
 
-    # Run for the specified number of epochs.
+    # ### 6. Training Loop
     for epoch in range(args.epochs):
         model.train()
         train_loss = 0
         num_batches = 0
-        for batch in tqdm(sst_train_dataloader, desc=f'train-{epoch}', disable=TQDM_DISABLE):
-            b_ids, b_mask, b_labels = (batch['token_ids'],
-                                       batch['attention_mask'], batch['labels'])
 
-            b_ids = b_ids.to(device)
-            b_mask = b_mask.to(device)
-            b_labels = b_labels.to(device)
+        # Iterate over batches from all three data loaders simultaneously
+        for sst_batch, para_batch, sts_batch in tqdm(
+            zip(sst_train_dataloader, para_train_dataloader, sts_train_dataloader),
+            desc=f'train-{epoch}',
+            disable=TQDM_DISABLE
+        ):
+            # #### Process SST Batch (Sentiment Analysis)
+            sst_ids = sst_batch['token_ids'].to(device)
+            sst_mask = sst_batch['attention_mask'].to(device)
+            sst_labels = sst_batch['labels'].to(device)
+            logits = model.predict_sentiment(sst_ids, sst_mask)
+            sent_loss = F.cross_entropy(logits, sst_labels.view(-1), reduction='mean')
 
+            # #### Process Quora Batch (Paraphrase Detection)
+            para_ids1 = para_batch['token_ids_1'].to(device)
+            para_mask1 = para_batch['attention_mask_1'].to(device)
+            para_ids2 = para_batch['token_ids_2'].to(device)
+            para_mask2 = para_batch['attention_mask_2'].to(device)
+            para_labels = para_batch['labels'].to(device)  # 0 or 1
+            emb1, emb2 = model.predict_paraphrase(para_ids1, para_mask1, para_ids2, para_mask2)
+            # Convert labels to 1 (paraphrase) or -1 (not paraphrase) for cosine embedding loss
+            para_target = 2 * para_labels - 1
+            para_loss = F.cosine_embedding_loss(
+                emb1, emb2, para_target, margin=0.5, reduction='mean'
+            )
+
+            # #### Process STS Batch (Semantic Textual Similarity)
+            sts_ids1 = sts_batch['token_ids_1'].to(device)
+            sts_mask1 = sts_batch['attention_mask_1'].to(device)
+            sts_ids2 = sts_batch['token_ids_2'].to(device)
+            sts_mask2 = sts_batch['attention_mask_2'].to(device)
+            sts_labels = sts_batch['labels'].to(device)  # Typically 0 to 5
+            emb1, emb2 = model.predict_similarity(sts_ids1, sts_mask1, sts_ids2, sts_mask2)
+            cosine_sim = F.cosine_similarity(emb1, emb2)  # Range: [-1, 1]
+            predicted_sim = (cosine_sim + 1) / 2  # Map to [0, 1]
+            normalized_labels = sts_labels / 5.0  # Normalize 0-5 to 0-1
+            sts_loss = F.mse_loss(predicted_sim, normalized_labels, reduction='mean')
+
+            # #### Combine Losses and Update Model
+            total_loss = sent_loss + para_loss + sts_loss
             optimizer.zero_grad()
-            logits = model.predict_sentiment(b_ids, b_mask)
-            loss = F.cross_entropy(logits, b_labels.view(-1), reduction='sum') / args.batch_size
-
-            loss.backward()
+            total_loss.backward()
             optimizer.step()
 
-            train_loss += loss.item()
+            train_loss += total_loss.item()
             num_batches += 1
 
-        train_loss = train_loss / (num_batches)
+        train_loss = train_loss / num_batches
 
-        train_acc, train_f1, *_ = model_eval_sst(sst_train_dataloader, model, device)
-        dev_acc, dev_f1, *_ = model_eval_sst(sst_dev_dataloader, model, device)
+        # ### 7. Evaluation
+        # Evaluate on all tasks using the provided model_eval_multitask function
+        dev_metrics = model_eval_multitask(
+            sst_dev_dataloader, para_dev_dataloader, sts_dev_dataloader, model, device
+        )
+        # Assuming dev_metrics returns a dict like {'sst_acc': float, 'para_acc': float, 'sts_corr': float}
 
-        if dev_acc > best_dev_acc:
-            best_dev_acc = dev_acc
+        # ### 8. Logging and Model Saving
+        if dev_metrics['sst_acc'] > best_dev_acc:
+            best_dev_acc = dev_metrics['sst_acc']
             save_model(model, optimizer, args, config, args.filepath)
 
-        print(f"Epoch {epoch}: train loss :: {train_loss :.3f}, train acc :: {train_acc :.3f}, dev acc :: {dev_acc :.3f}")
-
+        print(
+            f"Epoch {epoch}: train loss :: {train_loss:.3f}, "
+            f"dev sst acc :: {dev_metrics['sst_acc']:.3f}, "
+            f"dev para acc :: {dev_metrics['para_acc']:.3f}, "
+            f"dev sts corr :: {dev_metrics['sts_corr']:.3f}"
+        )
 
 def test_multitask(args):
     '''Test and save predictions on the dev and test sets of all three tasks.'''
