@@ -41,10 +41,13 @@ class MultitaskBERT(nn.Module):
                 param.requires_grad = False
             elif config.option == 'finetune':
                 param.requires_grad = True
-        # Dropout layer for regularization
         self.dropout = nn.Dropout(config.hidden_dropout_prob)
-        # Sentiment classification head
-        self.sentiment_classifier = nn.Linear(config.hidden_size, N_SENTIMENT_CLASSES)
+        # Assuming 5 sentiment classes; adjust if different
+        self.sentiment_classifier = nn.Linear(config.hidden_size, 5)
+        # Add heads for paraphrase and STS
+        self.paraphrase_classifier = nn.Linear(3 * config.hidden_size, 1)
+        self.sts_regressor = nn.Linear(3 * config.hidden_size, 1)
+        
 
     def forward(self, input_ids, attention_mask):
         '''
@@ -74,7 +77,7 @@ class MultitaskBERT(nn.Module):
         '''
         embeddings = self.forward(input_ids, attention_mask)
         embeddings = self.dropout(embeddings)
-        logits = self.sentiment_classifier(embeddings)
+        logits = self.sentiment_classifier(embeddings)  # Shape: (batch_size, 5)
         return logits
 
     def predict_paraphrase(self, input_ids_1, attention_mask_1, input_ids_2, attention_mask_2):
@@ -88,9 +91,13 @@ class MultitaskBERT(nn.Module):
         Returns:
             tuple: (emb1, emb2) embeddings for the two sentences.
         '''
-        emb1 = self.forward(input_ids_1, attention_mask_1)
-        emb2 = self.forward(input_ids_2, attention_mask_2)
-        return emb1, emb2
+        emb1 = self.forward(input_ids_1, attention_mask_1)  # Shape: (batch_size, hidden_size)
+        emb2 = self.forward(input_ids_2, attention_mask_2)  # Shape: (batch_size, hidden_size)
+        abs_diff = torch.abs(emb1 - emb2)  # Element-wise absolute difference
+        combined = torch.cat([emb1, emb2, abs_diff], dim=1)  # Shape: (batch_size, 3 * hidden_size)
+        combined = self.dropout(combined)
+        logits = self.paraphrase_classifier(combined)  # Shape: (batch_size, 1)
+        return logits
 
     def predict_similarity(self, input_ids_1, attention_mask_1, input_ids_2, attention_mask_2):
         '''
@@ -103,9 +110,13 @@ class MultitaskBERT(nn.Module):
         Returns:
             tuple: (emb1, emb2) embeddings for the two sentences.
         '''
-        emb1 = self.forward(input_ids_1, attention_mask_1)
-        emb2 = self.forward(input_ids_2, attention_mask_2)
-        return emb1, emb2
+        emb1 = self.forward(input_ids_1, attention_mask_1)  # Shape: (batch_size, hidden_size)
+        emb2 = self.forward(input_ids_2, attention_mask_2)  # Shape: (batch_size, hidden_size)
+        abs_diff = torch.abs(emb1 - emb2)  # Element-wise absolute difference
+        combined = torch.cat([emb1, emb2, abs_diff], dim=1)  # Shape: (batch_size, 3 * hidden_size)
+        combined = self.dropout(combined)
+        scores = self.sts_regressor(combined)  # Shape: (batch_size, 1)
+        return scores
 
 def compute_simcse_loss(model, input_ids, attention_mask, device, tau=0.05):
     '''
@@ -153,14 +164,11 @@ def save_model(model, optimizer, args, config, filepath):
     }
     torch.save(save_info, filepath)
     print(f"save the model to {filepath}")
-
 def train_multitask(args):
-    '''
-    Train MultitaskBERT with SimCSE on SST, Quora, and STS datasets simultaneously.
-    '''
+    # Set device
     device = torch.device('cuda') if args.use_gpu else torch.device('cpu')
 
-    # Load data
+    # Load multitask data
     sst_train_data, num_labels, para_train_data, sts_train_data = load_multitask_data(
         args.sst_train, args.para_train, args.sts_train, split='train'
     )
@@ -196,7 +204,7 @@ def train_multitask(args):
         sts_dev_data, shuffle=False, batch_size=args.batch_size, collate_fn=sts_dev_data.collate_fn
     )
 
-    # Initialize model
+    # Initialize model configuration
     config = {
         'hidden_dropout_prob': args.hidden_dropout_prob,
         'num_labels': num_labels,
@@ -213,61 +221,64 @@ def train_multitask(args):
     best_dev_acc = 0
     lambda_simcse = 1.0  # Weight for SimCSE loss
 
+    # Define loss functions
+    sentiment_loss_fn = nn.CrossEntropyLoss()  # For sentiment classification (multi-class)
+    paraphrase_loss_fn = nn.BCEWithLogitsLoss()  # For paraphrase detection (binary classification)
+    sts_loss_fn = nn.MSELoss()  # For STS (regression)
+
     # Training loop
     for epoch in range(args.epochs):
         model.train()
         train_loss = 0
         num_batches = 0
 
+        # Iterate over batches from all tasks
         for sst_batch, para_batch, sts_batch in tqdm(
             zip(sst_train_dataloader, para_train_dataloader, sts_train_dataloader),
             desc=f'train-{epoch}',
-            disable=TQDM_DISABLE
-        ):
-            # Process SST batch (Sentiment Classification)
+            disable=TQDM_DISABLE):
+            ### Sentiment Classification (SST)
             sst_ids = sst_batch['token_ids'].to(device)
             sst_mask = sst_batch['attention_mask'].to(device)
-            sst_labels = sst_batch['labels'].to(device)
-            logits = model.predict_sentiment(sst_ids, sst_mask)
-            sent_loss = F.cross_entropy(logits, sst_labels.view(-1), reduction='mean')
-            # SimCSE loss for SST sentences
+            sst_labels = sst_batch['labels'].to(device)  # Shape: (batch_size,)
+            sentiment_logits = model.predict_sentiment(sst_ids, sst_mask)  # Shape: (batch_size, 5)
+            sent_loss = sentiment_loss_fn(sentiment_logits, sst_labels)
+            # SimCSE loss for SST
             simcse_loss_sst = compute_simcse_loss(model, sst_ids, sst_mask, device)
 
-            # Process Quora batch (Paraphrase Detection)
+            ### Paraphrase Detection (Quora)
             para_ids1 = para_batch['token_ids_1'].to(device)
             para_mask1 = para_batch['attention_mask_1'].to(device)
             para_ids2 = para_batch['token_ids_2'].to(device)
             para_mask2 = para_batch['attention_mask_2'].to(device)
-            para_labels = para_batch['labels'].to(device)  # 0 or 1
-            emb1, emb2 = model.predict_paraphrase(para_ids1, para_mask1, para_ids2, para_mask2)
-            para_target = 2 * para_labels - 1  # Convert to -1 or 1
-            para_loss = F.cosine_embedding_loss(emb1, emb2, para_target, margin=0.5, reduction='mean')
-            # SimCSE loss for Quora sentences
+            para_labels = para_batch['labels'].to(device).float()  # Shape: (batch_size,), 0 or 1
+            paraphrase_logits = model.predict_paraphrase(para_ids1, para_mask1, para_ids2, para_mask2)  # Shape: (batch_size, 1)
+            paraphrase_logits = paraphrase_logits.squeeze(1)  # Shape: (batch_size,)
+            para_loss = paraphrase_loss_fn(paraphrase_logits, para_labels)
+            # SimCSE loss for Quora
             simcse_loss_para1 = compute_simcse_loss(model, para_ids1, para_mask1, device)
             simcse_loss_para2 = compute_simcse_loss(model, para_ids2, para_mask2, device)
             simcse_loss_para = (simcse_loss_para1 + simcse_loss_para2) / 2
 
-            # Process STS batch (Semantic Textual Similarity)
+            ### Semantic Textual Similarity (STS)
             sts_ids1 = sts_batch['token_ids_1'].to(device)
             sts_mask1 = sts_batch['attention_mask_1'].to(device)
             sts_ids2 = sts_batch['token_ids_2'].to(device)
             sts_mask2 = sts_batch['attention_mask_2'].to(device)
-            sts_labels = sts_batch['labels'].to(device)  # 0 to 5
-            emb1, emb2 = model.predict_similarity(sts_ids1, sts_mask1, sts_ids2, sts_mask2)
-            cosine_sim = F.cosine_similarity(emb1, emb2)  # [-1, 1]
-            predicted_sim = (cosine_sim + 1) / 2  # [0, 1]
-            normalized_labels = sts_labels / 5.0  # Normalize to [0, 1]
-            sts_loss = F.mse_loss(predicted_sim, normalized_labels, reduction='mean')
-            # SimCSE loss for STS sentences
+            sts_labels = sts_batch['labels'].to(device).float()  # Shape: (batch_size,), e.g., 0 to 5
+            similarity_scores = model.predict_similarity(sts_ids1, sts_mask1, sts_ids2, sts_mask2)  # Shape: (batch_size, 1)
+            similarity_scores = similarity_scores.squeeze(1)  # Shape: (batch_size,)
+            sts_loss = sts_loss_fn(similarity_scores, sts_labels)
+            # SimCSE loss for STS
             simcse_loss_sts1 = compute_simcse_loss(model, sts_ids1, sts_mask1, device)
             simcse_loss_sts2 = compute_simcse_loss(model, sts_ids2, sts_mask2, device)
             simcse_loss_sts = (simcse_loss_sts1 + simcse_loss_sts2) / 2
 
-            # Combine all losses
+            ### Combine Losses
             total_simcse_loss = simcse_loss_sst + simcse_loss_para + simcse_loss_sts
             total_loss = sent_loss + para_loss + sts_loss + lambda_simcse * total_simcse_loss
 
-            # Backpropagation and optimization
+            ### Backpropagation
             optimizer.zero_grad()
             total_loss.backward()
             optimizer.step()
@@ -275,25 +286,28 @@ def train_multitask(args):
             train_loss += total_loss.item()
             num_batches += 1
 
+        # Compute average training loss
         train_loss = train_loss / num_batches
 
-        # Evaluation
+        # Evaluate on development set
         dev_metrics = model_eval_multitask(
             sst_dev_dataloader, para_dev_dataloader, sts_dev_dataloader, model, device
         )
 
-        # Save best model based on SST accuracy
+        # Save model if SST accuracy improves
         if dev_metrics['sst_acc'] > best_dev_acc:
             best_dev_acc = dev_metrics['sst_acc']
             save_model(model, optimizer, args, config, args.filepath)
 
+        # Print epoch results
         print(
             f"Epoch {epoch}: train loss :: {train_loss:.3f}, "
             f"dev sst acc :: {dev_metrics['sst_acc']:.3f}, "
             f"dev para acc :: {dev_metrics['para_acc']:.3f}, "
             f"dev sts corr :: {dev_metrics['sts_corr']:.3f}"
         )
-
+        
+        
 def test_multitask(args):
     '''Test and save predictions on the dev and test sets of all three tasks.'''
     with torch.no_grad():
